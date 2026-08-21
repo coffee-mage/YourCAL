@@ -313,6 +313,21 @@ watch(
   },
 )
 
+// Moving the start date should carry the end date along with it so a
+// multi-day span keeps its length instead of silently becoming invalid
+// (or requiring a second manual edit) whenever the start is nudged.
+watch(
+  () => form.startDate,
+  (newStart, oldStart) => {
+    if (!oldStart || !newStart) return
+    const dayDelta = DateTime.fromFormat(form.endDate, 'yyyy-LL-dd').diff(
+      DateTime.fromFormat(oldStart, 'yyyy-LL-dd'),
+      'days',
+    ).days
+    form.endDate = DateTime.fromFormat(newStart, 'yyyy-LL-dd').plus({ days: dayDelta }).toFormat('yyyy-LL-dd')
+  },
+)
+
 const swatchColor = computed(
   () => form.color || props.calendars.find((c) => c.id === form.calendarId)?.color || '#0082c9',
 )
