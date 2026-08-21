@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useCalendarsStore } from '../stores/calendars.js'
-import { useSettingsStore, type CalendarSortOrder, type WeekStart } from '../stores/settings.js'
+import { useSettingsStore, type CalendarSortOrder, type CalendarViewType, type WeekStart } from '../stores/settings.js'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -16,6 +16,11 @@ const weekStartModel = computed<WeekStart>({
 const calendarSortOrderModel = computed<CalendarSortOrder>({
   get: () => settingsStore.calendarSortOrder,
   set: (value) => settingsStore.setCalendarSortOrder(value),
+})
+
+const defaultViewModel = computed<CalendarViewType>({
+  get: () => settingsStore.defaultView,
+  set: (value) => settingsStore.setDefaultView(value),
 })
 
 // Same "writable + currently enabled" restriction CalendarView applies when
@@ -62,6 +67,16 @@ function toggleDefaultVisible(id: string): void {
         <select v-model="weekStartModel">
           <option value="sunday">Sunday</option>
           <option value="monday">Monday</option>
+        </select>
+      </label>
+
+      <label class="dialog__field dialog__field--row">
+        <span>Default view</span>
+        <select v-model="defaultViewModel">
+          <option value="dayGridMonth">Month</option>
+          <option value="timeGridWeek">Week</option>
+          <option value="timeGridDay">Day</option>
+          <option value="listUpcoming">List</option>
         </select>
       </label>
 
