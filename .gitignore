@@ -9,3 +9,4 @@ dist/
 /.dev-baikal/
 /flake.nix
 /flake.lock
+.claude/settings.local.json
