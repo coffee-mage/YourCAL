@@ -12,6 +12,7 @@ export type CalendarSortOrder = 'server' | 'name-asc' | 'name-desc'
 const STORAGE_KEY = 'calendar.weekStart'
 const DEFAULT_CALENDAR_STORAGE_KEY = 'calendar.defaultCalendarId'
 const SORT_ORDER_STORAGE_KEY = 'calendar.sortOrder'
+const DEFAULT_VISIBLE_CALENDARS_STORAGE_KEY = 'calendar.defaultVisibleCalendarIds'
 
 function loadInitial(): WeekStart {
   const stored = localStorage.getItem(STORAGE_KEY)
@@ -23,10 +24,24 @@ function loadSortOrder(): CalendarSortOrder {
   return stored === 'name-asc' || stored === 'name-desc' ? stored : 'server'
 }
 
+// Empty means "no preference set" -- every calendar starts visible, same as
+// before this setting existed. A non-empty list is an explicit whitelist of
+// which calendars should be checked on load.
+function loadDefaultVisibleCalendarIds(): string[] {
+  try {
+    const raw = localStorage.getItem(DEFAULT_VISIBLE_CALENDARS_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 export const useSettingsStore = defineStore('settings', () => {
   const weekStart = ref<WeekStart>(loadInitial())
   const defaultCalendarId = ref<string>(localStorage.getItem(DEFAULT_CALENDAR_STORAGE_KEY) ?? '')
   const calendarSortOrder = ref<CalendarSortOrder>(loadSortOrder())
+  const defaultVisibleCalendarIds = ref<string[]>(loadDefaultVisibleCalendarIds())
 
   // FullCalendar's firstDay option: 0 = Sunday, 1 = Monday.
   const firstDay = computed(() => (weekStart.value === 'monday' ? 1 : 0))
@@ -46,6 +61,11 @@ export const useSettingsStore = defineStore('settings', () => {
     localStorage.setItem(SORT_ORDER_STORAGE_KEY, value)
   }
 
+  function setDefaultVisibleCalendarIds(ids: string[]): void {
+    defaultVisibleCalendarIds.value = ids
+    localStorage.setItem(DEFAULT_VISIBLE_CALENDARS_STORAGE_KEY, JSON.stringify(ids))
+  }
+
   return {
     weekStart,
     firstDay,
@@ -54,5 +74,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setDefaultCalendarId,
     calendarSortOrder,
     setCalendarSortOrder,
+    defaultVisibleCalendarIds,
+    setDefaultVisibleCalendarIds,
   }
 })

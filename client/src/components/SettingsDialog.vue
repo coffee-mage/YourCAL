@@ -35,6 +35,21 @@ const defaultCalendarModel = computed<string>({
   get: () => preferredDefaultCalendarId.value,
   set: (value) => settingsStore.setDefaultCalendarId(value),
 })
+
+// An empty preference list means "no explicit choice yet" -- every calendar
+// is visible, same as before this setting existed -- so an unset checkbox
+// still reads as checked.
+function isDefaultVisible(id: string): boolean {
+  const ids = settingsStore.defaultVisibleCalendarIds
+  return ids.length === 0 || ids.includes(id)
+}
+
+function toggleDefaultVisible(id: string): void {
+  const allIds = calendarsStore.calendars.map((c) => c.id)
+  const current = settingsStore.defaultVisibleCalendarIds.length === 0 ? allIds : settingsStore.defaultVisibleCalendarIds
+  const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id]
+  settingsStore.setDefaultVisibleCalendarIds(next)
+}
 </script>
 
 <template>
@@ -67,6 +82,18 @@ const defaultCalendarModel = computed<string>({
           </option>
         </select>
       </label>
+
+      <div v-if="calendarsStore.calendars.length > 0" class="dialog__field">
+        <span>Default visible calendars</span>
+        <label v-for="cal in calendarsStore.calendars" :key="cal.id" class="dialog__checkbox">
+          <input
+            type="checkbox"
+            :checked="isDefaultVisible(cal.id)"
+            @change="toggleDefaultVisible(cal.id)"
+          />
+          {{ cal.displayName }}
+        </label>
+      </div>
 
       <div class="dialog__actions">
         <button type="button" class="btn btn-primary" @click="emit('close')">Done</button>
@@ -112,6 +139,14 @@ const defaultCalendarModel = computed<string>({
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
+}
+.dialog__checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: inherit;
 }
 .dialog__field select {
   padding: 0.3rem 0.4rem;
