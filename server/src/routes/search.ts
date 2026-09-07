@@ -3,9 +3,13 @@ import type { FastifyInstance } from 'fastify'
 import { store } from '../store/index.js'
 import { requireSession } from './requireSession.js'
 
+function invalidDate(value: string | undefined): boolean {
+  return value !== undefined && Number.isNaN(new Date(value).getTime())
+}
+
 const DEFAULT_WINDOW_PAST_DAYS = 365
 const DEFAULT_WINDOW_FUTURE_DAYS = 730
-const MAX_RESULTS = 100
+const MAX_RESULTS = 25
 
 function matches(event: CalendarObject, needle: string): boolean {
   return (
@@ -13,6 +17,23 @@ function matches(event: CalendarObject, needle: string): boolean {
     (event.description?.toLowerCase().includes(needle) ?? false) ||
     (event.location?.toLowerCase().includes(needle) ?? false)
   )
+}
+
+/**
+ * Fallback used when the store has no real search index (the plain
+ * DavCalendarStore): discover every calendar and substring-scan its events
+ * over a bounded window. Scales with calendar count x window, not an index
+ * -- fine at personal scale, but capped in date range by construction.
+ */
+async function windowSweep(
+  dav: Parameters<typeof store.discoverCalendars>[0],
+  needle: string,
+  start: string,
+  end: string,
+): Promise<CalendarObject[]> {
+  const calendars = await store.discoverCalendars(dav)
+  const perCalendar = await Promise.all(calendars.map((cal) => store.getEvents(dav, cal.id, { start, end })))
+  return perCalendar.flat().filter((event) => matches(event, needle))
 }
 
 export async function searchRoutes(app: FastifyInstance): Promise<void> {
@@ -24,24 +45,25 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
     if (!q) {
       return reply.code(400).send({ error: 'bad_request', message: 'q query param is required' })
     }
-
-    const now = new Date()
-    const start = req.query.start ?? new Date(now.getTime() - DEFAULT_WINDOW_PAST_DAYS * 86400000).toISOString()
-    const end = req.query.end ?? new Date(now.getTime() + DEFAULT_WINDOW_FUTURE_DAYS * 86400000).toISOString()
+    if (invalidDate(req.query.start) || invalidDate(req.query.end)) {
+      return reply.code(400).send({ error: 'bad_request', message: 'start and end must be valid ISO dates' })
+    }
 
     const needle = q.toLowerCase()
-    const calendars = await store.discoverCalendars(dav)
 
-    const perCalendar = await Promise.all(
-      calendars.map((cal) => store.getEvents(dav, cal.id, { start, end })),
-    )
+    // When the store maintains a text index (SqliteCalendarStore, i.e.
+    // CACHE_ENABLED), use it for a genuine full-history search. Otherwise
+    // fall back to the bounded per-calendar sweep.
+    const unsorted = store.searchEvents
+      ? await store.searchEvents(dav, q)
+      : await (async () => {
+          const now = new Date()
+          const start = req.query.start ?? new Date(now.getTime() - DEFAULT_WINDOW_PAST_DAYS * 86400000).toISOString()
+          const end = req.query.end ?? new Date(now.getTime() + DEFAULT_WINDOW_FUTURE_DAYS * 86400000).toISOString()
+          return windowSweep(dav, needle, start, end)
+        })()
 
-    const results = perCalendar
-      .flat()
-      .filter((event) => matches(event, needle))
-      .sort((a, b) => a.start.localeCompare(b.start))
-      .slice(0, MAX_RESULTS)
-
+    const results = [...unsorted].sort((a, b) => a.start.localeCompare(b.start)).slice(0, MAX_RESULTS)
     return reply.send(results)
   })
 }

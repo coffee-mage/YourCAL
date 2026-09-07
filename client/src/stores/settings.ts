@@ -14,8 +14,15 @@ export type CalendarSortOrder = 'server' | 'name-asc' | 'name-desc'
 // keep in sync if a view is ever renamed or removed there.
 export type CalendarViewType = 'dayGridMonth' | 'timeGridWeek' | 'timeGridDay' | 'listUpcoming'
 
+// 'fixed'     -> new events always default to defaultCalendarId
+// 'last-used' -> new events default to whichever calendar the last event was
+//                created in, falling back to defaultCalendarId
+export type DefaultCalendarMode = 'fixed' | 'last-used'
+
 const STORAGE_KEY = 'calendar.weekStart'
 const DEFAULT_CALENDAR_STORAGE_KEY = 'calendar.defaultCalendarId'
+const DEFAULT_CALENDAR_MODE_STORAGE_KEY = 'calendar.defaultCalendarMode'
+const LAST_USED_CALENDAR_STORAGE_KEY = 'calendar.lastUsedCalendarId'
 const SORT_ORDER_STORAGE_KEY = 'calendar.sortOrder'
 const DEFAULT_VISIBLE_CALENDARS_STORAGE_KEY = 'calendar.defaultVisibleCalendarIds'
 const DEFAULT_VIEW_STORAGE_KEY = 'calendar.defaultView'
@@ -30,6 +37,10 @@ function loadDefaultView(): CalendarViewType {
 function loadInitial(): WeekStart {
   const stored = localStorage.getItem(STORAGE_KEY)
   return stored === 'monday' ? 'monday' : 'sunday'
+}
+
+function loadDefaultCalendarMode(): DefaultCalendarMode {
+  return localStorage.getItem(DEFAULT_CALENDAR_MODE_STORAGE_KEY) === 'last-used' ? 'last-used' : 'fixed'
 }
 
 function loadSortOrder(): CalendarSortOrder {
@@ -53,6 +64,8 @@ function loadDefaultVisibleCalendarIds(): string[] {
 export const useSettingsStore = defineStore('settings', () => {
   const weekStart = ref<WeekStart>(loadInitial())
   const defaultCalendarId = ref<string>(localStorage.getItem(DEFAULT_CALENDAR_STORAGE_KEY) ?? '')
+  const defaultCalendarMode = ref<DefaultCalendarMode>(loadDefaultCalendarMode())
+  const lastUsedCalendarId = ref<string>(localStorage.getItem(LAST_USED_CALENDAR_STORAGE_KEY) ?? '')
   const calendarSortOrder = ref<CalendarSortOrder>(loadSortOrder())
   const defaultVisibleCalendarIds = ref<string[]>(loadDefaultVisibleCalendarIds())
   const defaultView = ref<CalendarViewType>(loadDefaultView())
@@ -68,6 +81,16 @@ export const useSettingsStore = defineStore('settings', () => {
   function setDefaultCalendarId(value: string): void {
     defaultCalendarId.value = value
     localStorage.setItem(DEFAULT_CALENDAR_STORAGE_KEY, value)
+  }
+
+  function setDefaultCalendarMode(value: DefaultCalendarMode): void {
+    defaultCalendarMode.value = value
+    localStorage.setItem(DEFAULT_CALENDAR_MODE_STORAGE_KEY, value)
+  }
+
+  function setLastUsedCalendarId(value: string): void {
+    lastUsedCalendarId.value = value
+    localStorage.setItem(LAST_USED_CALENDAR_STORAGE_KEY, value)
   }
 
   function setCalendarSortOrder(value: CalendarSortOrder): void {
@@ -91,6 +114,10 @@ export const useSettingsStore = defineStore('settings', () => {
     setWeekStart,
     defaultCalendarId,
     setDefaultCalendarId,
+    defaultCalendarMode,
+    setDefaultCalendarMode,
+    lastUsedCalendarId,
+    setLastUsedCalendarId,
     calendarSortOrder,
     setCalendarSortOrder,
     defaultVisibleCalendarIds,

@@ -2,31 +2,39 @@
 import type { CalendarOptions, DatesSetArg, DateSelectArg, EventClickArg, EventDropArg } from '@fullcalendar/core'
 import dayGridPlugin from '@fullcalendar/daygrid'
 import interactionPlugin from '@fullcalendar/interaction'
-import type { EventResizeDoneArg } from '@fullcalendar/interaction'
-import FullCalendar from '@fullcalendar/vue3'
+import type { DateClickArg, EventResizeDoneArg } from '@fullcalendar/interaction'
 import listPlugin from '@fullcalendar/list'
-
+import multiMonthPlugin from '@fullcalendar/multimonth'
+import FullCalendar from '@fullcalendar/vue3'
 import timeGridPlugin from '@fullcalendar/timegrid'
 import type { CalendarObject, EditScope, EventFields } from '@yourcal/shared'
 import { DateTime } from 'luxon'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import CalendarList from '../components/CalendarList.vue'
 import ConflictDialog from '../components/ConflictDialog.vue'
 import EventDetailPopover from '../components/EventDetailPopover.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import DuplicateScopeDialog from '../components/DuplicateScopeDialog.vue'
+import type { DuplicateScope } from '../components/DuplicateScopeDialog.vue'
 import EventEditDialog from '../components/EventEditDialog.vue'
 import ImportDialog from '../components/ImportDialog.vue'
+import MiniMonth from '../components/MiniMonth.vue'
+import PrintView from '../components/PrintView.vue'
+import type { PrintEvent } from '../components/PrintView.vue'
 import RecurrenceScopeDialog from '../components/RecurrenceScopeDialog.vue'
 import SearchBox from '../components/SearchBox.vue'
 import SettingsDialog from '../components/SettingsDialog.vue'
 import SubscriptionList from '../components/SubscriptionList.vue'
-import { ApiRequestError } from '../api.js'
+import UndoToast from '../components/UndoToast.vue'
+import { api, ApiRequestError } from '../api.js'
 import { useCalendarsStore } from '../stores/calendars.js'
 import { useEventsStore } from '../stores/events.js'
 import { useNotificationsStore } from '../stores/notifications.js'
 import { useSessionStore } from '../stores/session.js'
 import { useSettingsStore } from '../stores/settings.js'
 import { useSubscriptionsStore } from '../stores/subscriptions.js'
+import { useUndoStore } from '../stores/undo.js'
+import { useClipboardStore } from '../stores/clipboard.js'
 
 const listUpcomingView = {
   type: 'list',
@@ -46,11 +54,60 @@ const eventsStore = useEventsStore()
 const notificationsStore = useNotificationsStore()
 const settingsStore = useSettingsStore()
 const subscriptionsStore = useSubscriptionsStore()
+const undoStore = useUndoStore()
+const clipboardStore = useClipboardStore()
 
 const visibleRange = ref<{ start: string; end: string } | null>(null)
 const currentViewType = ref<string | null>(null)
 const LIST_UPCOMING_MAX_EVENTS = 100
 const errorBanner = ref<string | null>(null)
+
+// The browser prints FullCalendar's own table markup badly (missing grid
+// lines, header not aligned to the day columns), so a purpose-built static
+// <PrintView> is always mounted (hidden on screen) and swapped in by the
+// @media print rules. It's driven entirely by `printContext`, kept current
+// from onDatesSet -- so the browser's own Ctrl/Cmd-P works with no JS timing
+// (Firefox in particular doesn't reliably flush a reactive change during
+// beforeprint).
+interface PrintContext {
+  mode: 'month' | 'week' | 'day' | 'agenda' | 'year'
+  anchor: string
+  rangeStart: string
+  rangeEnd: string
+  title: string
+}
+const printContext = ref<PrintContext | null>(null)
+
+function viewTypeToMode(type: string): PrintContext['mode'] {
+  if (type === 'dayGridMonth') return 'month'
+  if (type.startsWith('timeGridWeek') || type === 'dayGridWeek') return 'week'
+  if (type.startsWith('timeGridDay') || type === 'dayGridDay') return 'day'
+  if (type === 'multiMonthYear') return 'year'
+  return 'agenda'
+}
+
+function printCalendar(): void {
+  window.print()
+}
+
+const printEvents = computed<PrintEvent[]>(() =>
+  rawVisibleEvents.value.map((e) => ({
+    id: `${e.calendarId}:${e.uid}:${e.recurrenceId ?? ''}`,
+    title: e.summary,
+    start: e.start,
+    end: e.end,
+    allDay: e.allDay,
+    color: e.color ?? calendarColors.value[e.calendarId] ?? '#3b82f6',
+  })),
+)
+// Transient positive feedback (e.g. "Event copied"), auto-clears.
+const noticeBanner = ref<string | null>(null)
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
+function flashNotice(message: string): void {
+  noticeBanner.value = message
+  if (noticeTimer !== undefined) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => (noticeBanner.value = null), 2000)
+}
 
 const enabledCalendarIds = computed(() =>
   calendarsStore.calendars.filter((c) => calendarsStore.enabled[c.id]).map((c) => c.id),
@@ -64,11 +121,19 @@ const writableEnabledCalendarIds = computed(() =>
 )
 // Prefer the user's saved default calendar, but fall back to the first
 // writable/enabled one if it's unset, disabled, hidden, or no longer exists.
-const preferredDefaultCalendarId = computed(() =>
-  writableEnabledCalendarIds.value.includes(settingsStore.defaultCalendarId)
-    ? settingsStore.defaultCalendarId
-    : (writableEnabledCalendarIds.value[0] ?? ''),
-)
+// In 'last-used' mode the most recently used calendar takes precedence over
+// the fixed default (still subject to the same writable/enabled check).
+const preferredDefaultCalendarId = computed(() => {
+  const candidates =
+    settingsStore.defaultCalendarMode === 'last-used'
+      ? [settingsStore.lastUsedCalendarId, settingsStore.defaultCalendarId]
+      : [settingsStore.defaultCalendarId]
+  return (
+    candidates.find((id) => writableEnabledCalendarIds.value.includes(id)) ??
+    writableEnabledCalendarIds.value[0] ??
+    ''
+  )
+})
 const calendarColors = computed(() => {
   const fromCalendars = Object.fromEntries(calendarsStore.calendars.map((c) => [c.id, calendarsStore.colorFor(c.id)]))
   const fromSubscriptions = Object.fromEntries(subscriptionsStore.subscriptions.map((s) => [s.id, s.color]))
@@ -152,10 +217,27 @@ async function loadVisibleRange(): Promise<void> {
   }
 }
 
+// The first day of the period the main view is showing (not arg.start,
+// which includes leading days from the previous month in a month grid) --
+// drives the sidebar mini-month so it follows the main calendar.
+const calendarDate = ref<string | null>(null)
+
 function onDatesSet(arg: DatesSetArg): void {
   currentViewType.value = arg.view.type
   visibleRange.value = { start: arg.start.toISOString(), end: arg.end.toISOString() }
+  calendarDate.value = arg.view.currentStart.toISOString()
+  printContext.value = {
+    mode: viewTypeToMode(arg.view.type),
+    anchor: arg.view.currentStart.toISOString(),
+    rangeStart: arg.start.toISOString(),
+    rangeEnd: arg.end.toISOString(),
+    title: arg.view.title,
+  }
   void loadVisibleRange()
+}
+
+function onMiniMonthNavigate(date: Date): void {
+  fullCalendarRef.value?.getApi().gotoDate(date)
 }
 
 // --- create / edit dialog state ---
@@ -166,6 +248,78 @@ const createSlot = ref<{ start: string; end: string; allDay: boolean } | null>(n
 const detailEvent = ref<CalendarObject | null>(null)
 const detailPosition = ref<{ x: number; y: number } | null>(null)
 const confirmingDelete = ref<CalendarObject | null>(null)
+
+// --- duplicate / copy-paste ---
+
+// A recurring event awaiting the "this occurrence vs whole series" choice.
+const duplicateScopeEvent = ref<CalendarObject | null>(null)
+// Seeds the create dialog with a pre-filled copy. `event` is the source
+// occurrence; `scope` decides whether the repeat rule is carried over.
+const duplicateTemplate = ref<{ event: CalendarObject; scope: DuplicateScope } | null>(null)
+
+// The CalendarObject handed to EventEditDialog as its content template --
+// a 'single' duplicate/paste strips all recurrence so it lands as a plain
+// one-off event.
+const duplicateTemplateObject = computed<CalendarObject | null>(() => {
+  const t = duplicateTemplate.value
+  if (!t) return null
+  return t.scope === 'series'
+    ? t.event
+    : { ...t.event, rrule: null, rdate: [], isRecurring: false, recurrenceId: null }
+})
+
+function requestDuplicate(event: CalendarObject): void {
+  if (isReadOnlyEvent(event)) return
+  if (event.isRecurring) {
+    duplicateScopeEvent.value = event
+  } else {
+    startDuplicate(event, 'single')
+  }
+}
+
+function startDuplicate(event: CalendarObject, scope: DuplicateScope): void {
+  closeDialogs()
+  duplicateTemplate.value = { event, scope }
+}
+
+function onDuplicateScopeChosen(scope: DuplicateScope): void {
+  const event = duplicateScopeEvent.value
+  duplicateScopeEvent.value = null
+  if (event) startDuplicate(event, scope)
+}
+
+function onDetailDuplicate(): void {
+  const event = detailEvent.value
+  onDetailClose()
+  if (event) requestDuplicate(event)
+}
+
+function onEditDuplicate(): void {
+  const event = editingEvent.value
+  closeDialogs()
+  if (event) requestDuplicate(event)
+}
+
+function onGlobalKeydown(e: KeyboardEvent): void {
+  if (!(e.ctrlKey || e.metaKey)) return
+  const target = e.target as HTMLElement | null
+  if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+  const key = e.key.toLowerCase()
+  if (key === 'c' && detailEvent.value) {
+    // Mirror the Duplicate action's guard -- a read-only source (shared
+    // calendar or subscription) can't be pasted back anywhere, so don't
+    // let it into the clipboard in the first place.
+    if (isReadOnlyEvent(detailEvent.value)) return
+    clipboardStore.copy(detailEvent.value)
+    flashNotice('Event copied — press Ctrl/⌘-V to paste a copy')
+  } else if (key === 'v' && clipboardStore.copied) {
+    e.preventDefault()
+    // Paste always lands as a one-off, even from a recurring source (the
+    // "whole series" path is only offered via the explicit Duplicate action).
+    if (isReadOnlyEvent(clipboardStore.copied)) return
+    startDuplicate(clipboardStore.copied, 'single')
+  }
+}
 
 function calendarNameFor(calendarId: string): string {
   const calendar = calendarsStore.calendars.find((c) => c.id === calendarId)
@@ -207,27 +361,93 @@ function onDetailDelete(): void {
   confirmingDelete.value = event
 }
 
+// A single click on a day fires both `dateClick` and `select`. To let a
+// double-click open the day view without the create dialog flashing open on
+// the first click, the create dialog is opened on a short delay that a
+// second click (or a year-view navigation) can cancel.
+const DOUBLE_CLICK_MS = 350
+const CREATE_DELAY_MS = 250
+let pendingCreateTimer: ReturnType<typeof setTimeout> | undefined
+let lastDayClick: { date: string; ts: number } | null = null
+let lastNavTs = 0
+
+function cancelPendingCreate(): void {
+  if (pendingCreateTimer !== undefined) {
+    clearTimeout(pendingCreateTimer)
+    pendingCreateTimer = undefined
+  }
+}
+
 function onSelect(arg: DateSelectArg): void {
   if (writableEnabledCalendarIds.value.length === 0) {
     errorBanner.value = 'No writable calendar is available -- enable or create one first.'
     return
   }
-  createSlot.value = { start: arg.start.toISOString(), end: arg.end.toISOString(), allDay: arg.allDay }
-  isCreating.value = true
+  // The year overview is for navigating, not creating -- onDateClick handles it.
+  if (fullCalendarRef.value?.getApi().view.type === 'multiMonthYear') return
+  // A double-click just navigated to the day view; don't also open create.
+  if (Date.now() - lastNavTs < DOUBLE_CLICK_MS + 100) return
+
+  // For an all-day selection FullCalendar's `start`/`end` are local midnight;
+  // toISOString() then rolls them to the previous calendar day in any
+  // positive-offset zone (e.g. BST: 2026-09-01 00:00 -> 2026-08-31T23:00Z).
+  // `startStr`/`endStr` are already the bare YYYY-MM-DD the dialog wants --
+  // the same rollover `dropDateString()` avoids for all-day drag/drop.
+  const slot = arg.allDay
+    ? { start: arg.startStr, end: arg.endStr, allDay: true }
+    : { start: arg.start.toISOString(), end: arg.end.toISOString(), allDay: false }
+  cancelPendingCreate()
+  pendingCreateTimer = setTimeout(() => {
+    pendingCreateTimer = undefined
+    createSlot.value = slot
+    isCreating.value = true
+  }, CREATE_DELAY_MS)
+}
+
+function onDateClick(arg: DateClickArg): void {
+  const api = fullCalendarRef.value?.getApi()
+
+  // Year view: a day click zooms into that month rather than creating an event.
+  if (api?.view.type === 'multiMonthYear') {
+    cancelPendingCreate()
+    lastNavTs = Date.now()
+    api.changeView('dayGridMonth', arg.date)
+    return
+  }
+
+  const now = Date.now()
+  if (lastDayClick && lastDayClick.date === arg.dateStr && now - lastDayClick.ts < DOUBLE_CLICK_MS) {
+    cancelPendingCreate()
+    lastDayClick = null
+    lastNavTs = now
+    api?.changeView('timeGridDay', arg.date)
+    return
+  }
+  lastDayClick = { date: arg.dateStr, ts: now }
 }
 
 function closeDialogs(): void {
+  // The detail popover sits above every dialog overlay; if it's left open
+  // (e.g. the Ctrl-V paste path, which doesn't go through onDetailClose)
+  // its Edit button can stack a second dialog on top of the new one.
+  detailEvent.value = null
+  detailPosition.value = null
   editingEvent.value = null
   isCreating.value = false
   createSlot.value = null
   pendingScopeAction.value = null
   confirmingDelete.value = null
+  duplicateScopeEvent.value = null
+  duplicateTemplate.value = null
 }
 
 async function onCreateSave(calendarId: string, fields: EventFields): Promise<void> {
   closeDialogs()
   try {
     await eventsStore.createEvent(calendarId, fields)
+    // Remember where this event landed so 'last-used' mode can default the
+    // next new-event dialog to the same calendar.
+    settingsStore.setLastUsedCalendarId(calendarId)
     // The reactive `events` option update alone doesn't always make
     // FullCalendar's Vue wrapper repaint the month grid in the same tick --
     // force it explicitly so the new event shows up immediately.
@@ -293,6 +513,7 @@ async function doUpdate(
       recurrenceId: event.recurrenceId,
       calendarId,
     })
+    offerEditUndo(event, calendarId, calendarId !== event.calendarId ? 'Moved' : 'Edited')
   } catch (err) {
     if (err instanceof ApiRequestError && err.status === 412) {
       await eventsStore.reloadLastRange()
@@ -305,13 +526,34 @@ async function doUpdate(
 }
 
 async function doDelete(event: CalendarObject, scope: EditScope): Promise<void> {
+  // Snapshot the full ICS before deleting so "Undo" can re-create the exact
+  // object -- UID, RRULE, EXDATEs and per-occurrence overrides intact --
+  // rather than a fresh-UID approximation. If the snapshot fails, the delete
+  // still proceeds, just without an undo offer.
+  let snapshotIcs: string | null = null
   try {
-    await eventsStore.deleteEvent(event.calendarId, event.uid, {
+    snapshotIcs = await api.exportEventIcs(event.calendarId, event.uid, event.href)
+  } catch {
+    snapshotIcs = null
+  }
+
+  try {
+    // A partial-scope delete leaves the rewritten series behind (fresh
+    // href/etag); Undo needs it to clear the series before restoring the
+    // snapshot, or the calendar ends up with two objects sharing the UID.
+    const remaining = await eventsStore.deleteEvent(event.calendarId, event.uid, {
       href: event.href,
       etag: event.etag,
       scope,
       recurrenceId: event.recurrenceId,
     })
+    if (snapshotIcs) {
+      const ics = snapshotIcs
+      undoStore.offer(`Deleted “${event.summary || '(No title)'}”`, async () => {
+        await eventsStore.restoreEvent(event.calendarId, event.uid, ics, remaining)
+        fullCalendarRef.value?.getApi().refetchEvents()
+      })
+    }
   } catch (err) {
     if (err instanceof ApiRequestError && err.status === 412) {
       await eventsStore.reloadLastRange()
@@ -365,6 +607,31 @@ function onScopeChosen(scope: EditScope): void {
 // --- drag / resize: FullCalendar renders the move immediately and calls
 // revert() if we report failure, giving true optimistic UX for free. ---
 
+// FullCalendar hands back a Date at local midnight for an all-day event.
+// Serialising that with toISOString() in a positive-offset timezone rolls
+// it back to the previous day (the server takes the UTC date), so emit a
+// bare local YYYY-MM-DD instead -- matching how all-day starts are stored.
+function dropDateString(d: Date | null, allDay: boolean, fallback: string): string {
+  if (!d) return fallback
+  return allDay ? (DateTime.fromJSDate(d).toISODate() ?? fallback) : d.toISOString()
+}
+
+// A drop moves an event by `delta` (a FullCalendar Duration). Applying that
+// delta to the event's *original* start/end keeps its duration intact. This
+// matters for all-day events: FullCalendar reports no `end` for a single-day
+// all-day event and an exclusive `end` otherwise, so deriving the new end
+// from `arg.event` alone collapses multi-day spans (and turns single-day
+// ones into a zero-length / previous-day event).
+function shiftAllDay(iso: string, delta: EventDropArg['delta']): string {
+  const moved = DateTime.fromISO(iso).plus({
+    years: delta.years ?? 0,
+    months: delta.months ?? 0,
+    days: delta.days ?? 0,
+    milliseconds: delta.milliseconds ?? 0,
+  })
+  return moved.toISODate() ?? iso.slice(0, 10)
+}
+
 function toFields(event: CalendarObject, start: string, end: string): EventFields {
   return {
     summary: event.summary,
@@ -381,6 +648,30 @@ function toFields(event: CalendarObject, start: string, end: string): EventField
   }
 }
 
+// Offer a short-lived "Undo" for a just-completed edit/move of a
+// non-recurring event. `before` is the pre-edit CalendarObject; undo
+// re-applies its original fields against the server's *current* etag
+// (looked up from the cache, which reloadLastRange has already refreshed
+// by the time this runs). Recurring events are skipped -- reverting them
+// correctly needs an edit-scope choice, out of scope for this toast.
+function offerEditUndo(before: CalendarObject, newCalendarId: string, verb: string): void {
+  if (before.isRecurring) return
+  const fresh = eventsStore.findEvent(newCalendarId, before.uid, null)
+  if (!fresh) return
+  const movedCalendars = newCalendarId !== before.calendarId
+  undoStore.offer(`${verb} “${before.summary || '(No title)'}”`, async () => {
+    await eventsStore.updateEvent(fresh.calendarId, fresh.uid, {
+      href: fresh.href,
+      etag: fresh.etag,
+      fields: toFields(before, before.start, before.end),
+      scope: 'all',
+      recurrenceId: null,
+      calendarId: movedCalendars ? before.calendarId : undefined,
+    })
+    fullCalendarRef.value?.getApi().refetchEvents()
+  })
+}
+
 async function onEventDrop(arg: EventDropArg): Promise<void> {
   const event = arg.event.extendedProps.source as CalendarObject
   if (event.isRecurring) {
@@ -390,8 +681,15 @@ async function onEventDrop(arg: EventDropArg): Promise<void> {
     errorBanner.value = 'Drag-and-drop is not yet supported for recurring events -- use the edit dialog.'
     return
   }
-  const start = arg.event.start?.toISOString() ?? event.start
-  const end = (arg.event.end ?? arg.event.start)?.toISOString() ?? event.end
+  let start: string
+  let end: string
+  if (event.allDay) {
+    start = shiftAllDay(event.start, arg.delta)
+    end = shiftAllDay(event.end, arg.delta)
+  } else {
+    start = dropDateString(arg.event.start, false, event.start)
+    end = dropDateString(arg.event.end ?? arg.event.start, false, event.end)
+  }
   try {
     await eventsStore.updateEvent(event.calendarId, event.uid, {
       href: event.href,
@@ -400,6 +698,7 @@ async function onEventDrop(arg: EventDropArg): Promise<void> {
       scope: 'all',
       recurrenceId: null,
     })
+    offerEditUndo(event, event.calendarId, 'Moved')
   } catch (err) {
     arg.revert()
     errorBanner.value = err instanceof ApiRequestError ? err.message : 'Failed to move event.'
@@ -414,8 +713,15 @@ async function onEventResize(arg: EventResizeDoneArg): Promise<void> {
     errorBanner.value = 'Resizing is not yet supported for recurring events -- use the edit dialog.'
     return
   }
-  const start = arg.event.start?.toISOString() ?? event.start
-  const end = (arg.event.end ?? arg.event.start)?.toISOString() ?? event.end
+  const start = dropDateString(arg.event.start, event.allDay, event.start)
+  // For an all-day event with no reported end (single-day), the exclusive
+  // DTEND is the day after the start, not the start itself.
+  const endDate =
+    arg.event.end ??
+    (event.allDay && arg.event.start
+      ? DateTime.fromJSDate(arg.event.start).plus({ days: 1 }).toJSDate()
+      : arg.event.start)
+  const end = dropDateString(endDate, event.allDay, event.end)
   try {
     await eventsStore.updateEvent(event.calendarId, event.uid, {
       href: event.href,
@@ -424,6 +730,7 @@ async function onEventResize(arg: EventResizeDoneArg): Promise<void> {
       scope: 'all',
       recurrenceId: null,
     })
+    offerEditUndo(event, event.calendarId, 'Resized')
   } catch (err) {
     arg.revert()
     errorBanner.value = err instanceof ApiRequestError ? err.message : 'Failed to resize event.'
@@ -432,8 +739,7 @@ async function onEventResize(arg: EventResizeDoneArg): Promise<void> {
 }
 
 const calendarOptions = computed<CalendarOptions>(() => ({
-
-  plugins: [dayGridPlugin, timeGridPlugin, interactionPlugin, listPlugin],
+  plugins: [dayGridPlugin, timeGridPlugin, interactionPlugin, listPlugin, multiMonthPlugin],
   initialView: settingsStore.defaultView,
   views: {
     listUpcoming: listUpcomingView,
@@ -441,9 +747,15 @@ const calendarOptions = computed<CalendarOptions>(() => ({
   headerToolbar: {
     left: 'prev,next today',
     center: 'title',
-    right: 'dayGridMonth,timeGridWeek,timeGridDay,listUpcoming',
+    right: 'multiMonthYear,dayGridMonth,timeGridWeek,timeGridDay,listMonth,listUpcoming',
   },
-
+  buttonText: {
+    listMonth: 'Agenda',
+    multiMonthYear: 'Year',
+  },
+  // The agenda view has nothing to show for an empty range -- spell that
+  // out rather than leaving a bare gap.
+  noEventsText: 'No events in this range',
   height: '100%',
   expandRows: true,
   dayMaxEventRows: true,
@@ -454,6 +766,7 @@ const calendarOptions = computed<CalendarOptions>(() => ({
   datesSet: onDatesSet,
   eventClick: onEventClick,
   select: onSelect,
+  dateClick: onDateClick,
   eventDrop: onEventDrop,
   eventResize: onEventResize,
 }))
@@ -517,8 +830,14 @@ function onImported(): void {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKeydown)
   await calendarsStore.load()
   await loadVisibleRange()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  if (noticeTimer !== undefined) clearTimeout(noticeTimer)
 })
 
 // A calendar created (or toggled on) after the initial load has never had
@@ -567,12 +886,25 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
           :title="writableEnabledCalendarIds.length === 0 ? 'No writable calendar is available' : undefined"
           @click="onNewEventClick"
         >
-          <span aria-hidden="true">+</span> New event
+          <span aria-hidden="true">+</span> New
         </button>
         <button class="btn btn-secondary sidebar__import" title="Import .ics file" @click="showImportDialog = true">
           Import
         </button>
+        <button
+          class="btn btn-secondary sidebar__print"
+          title="Print the current view"
+          @click="printCalendar"
+        >
+          Print
+        </button>
       </div>
+
+      <MiniMonth
+        :first-day="settingsStore.firstDay"
+        :focus-date="calendarDate"
+        @navigate="onMiniMonthNavigate"
+      />
 
       <CalendarList />
 
@@ -612,10 +944,25 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
       <Transition name="banner">
         <p v-if="errorBanner" class="error-banner" @click="errorBanner = null">{{ errorBanner }}</p>
       </Transition>
+      <Transition name="banner">
+        <p v-if="noticeBanner" class="notice-banner">{{ noticeBanner }}</p>
+      </Transition>
       <div ref="calendarCardRef" class="calendar-card">
         <FullCalendar ref="fullCalendarRef" :options="calendarOptions" />
       </div>
     </main>
+
+    <PrintView
+      v-if="printContext"
+      class="print-only"
+      :mode="printContext.mode"
+      :anchor="printContext.anchor"
+      :range-start="printContext.rangeStart"
+      :range-end="printContext.rangeEnd"
+      :title="printContext.title"
+      :week-start="settingsStore.firstDay"
+      :events="printEvents"
+    />
 
     <EventDetailPopover
       v-if="detailEvent && detailPosition"
@@ -627,6 +974,7 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
       :read-only="isReadOnlyEvent(detailEvent)"
       @edit="onDetailEdit"
       @delete="onDetailDelete"
+      @duplicate="onDetailDuplicate"
       @close="onDetailClose"
     />
 
@@ -647,6 +995,7 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
       :default-calendar-id="editingEvent.calendarId"
       @save="onEditSave"
       @remove="onEditDelete"
+      @duplicate="onEditDuplicate"
       @close="closeDialogs"
     />
 
@@ -662,10 +1011,30 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
       @close="closeDialogs"
     />
 
+    <EventEditDialog
+      v-if="duplicateTemplate && duplicateTemplateObject"
+      :event="null"
+      :calendars="calendarsStore.calendars"
+      :default-calendar-id="duplicateTemplate.event.calendarId"
+      :initial-start="duplicateTemplate.event.start"
+      :initial-end="duplicateTemplate.event.end"
+      :initial-all-day="duplicateTemplate.event.allDay"
+      :template="duplicateTemplateObject"
+      @save="onCreateSave"
+      @close="closeDialogs"
+    />
+
+    <DuplicateScopeDialog
+      v-if="duplicateScopeEvent"
+      :summary="duplicateScopeEvent.summary"
+      @choose="onDuplicateScopeChosen"
+      @cancel="duplicateScopeEvent = null"
+    />
+
     <ConfirmDialog
       v-if="confirmingDelete"
       title="Delete event?"
-      :message="`Delete “${confirmingDelete.summary || '(No title)'}”? This can't be undone.`"
+      :message="`Delete “${confirmingDelete.summary || '(No title)'}”?`"
       @confirm="onConfirmDelete"
       @cancel="confirmingDelete = null"
     />
@@ -685,6 +1054,8 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
       @discard="onConflictDiscard"
       @reapply="onConflictReapply"
     />
+
+    <UndoToast @error="errorBanner = $event" />
   </div>
 </template>
 
@@ -712,7 +1083,8 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
   flex: 1;
   font-size: 0.88rem;
 }
-.sidebar__import {
+.sidebar__import,
+.sidebar__print {
   flex-shrink: 0;
   font-size: 0.85rem;
   padding: 0.5rem 0.7rem;
@@ -828,6 +1200,14 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
   cursor: pointer;
   font-size: 0.85rem;
 }
+.notice-banner {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-sm);
+  margin: 0 0 0.85rem;
+  font-size: 0.85rem;
+}
 .banner-enter-active,
 .banner-leave-active {
   transition:
@@ -911,5 +1291,37 @@ watch(enabledSubscriptionIds, (ids, oldIds) => {
 .fc-timegrid-slot-label-cushion {
   color: var(--color-text-faint);
   font-size: 0.75rem;
+}
+
+/* --- Print --- the live FullCalendar prints its own table markup badly
+   (missing grid lines, header not aligned to the day columns), so while
+   printing the app renders a purpose-built static <PrintView> instead and
+   this block hides everything else. Unscoped so it reaches the teleported
+   toast/popover and PrintView's host element. */
+.print-only {
+  display: none;
+}
+@media print {
+  body,
+  #app,
+  .layout {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  .sidebar,
+  .main,
+  .undo-toast,
+  .popover,
+  .overlay {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  @page {
+    size: landscape;
+    margin: 1cm;
+  }
 }
 </style>

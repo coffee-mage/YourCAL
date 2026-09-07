@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useCalendarsStore } from '../stores/calendars.js'
-import { useSettingsStore, type CalendarSortOrder, type CalendarViewType, type WeekStart } from '../stores/settings.js'
+import {
+  useSettingsStore,
+  type CalendarSortOrder,
+  type CalendarViewType,
+  type DefaultCalendarMode,
+  type WeekStart,
+} from '../stores/settings.js'
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -55,6 +61,11 @@ function toggleDefaultVisible(id: string): void {
   const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id]
   settingsStore.setDefaultVisibleCalendarIds(next)
 }
+
+const defaultCalendarModeModel = computed<DefaultCalendarMode>({
+  get: () => settingsStore.defaultCalendarMode,
+  set: (value) => settingsStore.setDefaultCalendarMode(value),
+})
 </script>
 
 <template>
@@ -95,6 +106,14 @@ function toggleDefaultVisible(id: string): void {
           <option v-for="id in writableEnabledCalendarIds" :key="id" :value="id">
             {{ calendarsStore.calendars.find((c) => c.id === id)?.displayName }}
           </option>
+        </select>
+      </label>
+
+      <label v-if="writableEnabledCalendarIds.length > 0" class="dialog__field dialog__field--row">
+        <span>New events use</span>
+        <select v-model="defaultCalendarModeModel">
+          <option value="fixed">Default calendar</option>
+          <option value="last-used">Last used calendar</option>
         </select>
       </label>
 

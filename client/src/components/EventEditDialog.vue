@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AlarmFields, Calendar, CalendarObject, EventFields } from '@yourcal/shared'
 import { DateTime } from 'luxon'
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useSessionStore } from '../stores/session.js'
 import TimeCombobox from './TimeCombobox.vue'
 
@@ -14,13 +14,22 @@ const props = defineProps<{
   initialStart?: string
   initialEnd?: string
   initialAllDay?: boolean
+  // When creating (event === null), pre-fill the content fields (title,
+  // notes, recurrence, reminders, ...) from this event -- used by
+  // "Duplicate" / paste. The title is prefixed with "Copy of ".
+  template?: CalendarObject | null
 }>()
 
 const emit = defineEmits<{
   save: [calendarId: string, fields: EventFields]
   remove: []
+  duplicate: []
   close: []
 }>()
+
+// The event whose *content* seeds the form: the one being edited, or the
+// duplicate/paste template. Never drives isEditing (that's props.event only).
+const source = props.event ?? props.template ?? null
 
 type RepeatOption = 'none' | 'daily' | 'weekly' | 'monthly' | 'yearly'
 type RepeatEnd = 'never' | 'count' | 'until'
@@ -193,9 +202,9 @@ function parseRepeat(
   return { ...base, end: 'never', count: 1, until: fallbackUntil }
 }
 
-const initialAllDay = props.event?.allDay ?? props.initialAllDay ?? false
-const initialStartIso = props.event?.start ?? props.initialStart ?? new Date().toISOString()
-const initialEndIso = props.event?.end ?? props.initialEnd ?? initialStartIso
+const initialAllDay = props.event?.allDay ?? props.initialAllDay ?? source?.allDay ?? false
+const initialStartIso = props.event?.start ?? props.initialStart ?? source?.start ?? new Date().toISOString()
+const initialEndIso = props.event?.end ?? props.initialEnd ?? source?.end ?? initialStartIso
 
 // Intl.supportedValuesOf('timeZone') returns every IANA zone name the
 // runtime knows -- no separate timezone-data dependency needed client-side.
@@ -216,7 +225,7 @@ const browserZone = configuredDefaultZone ?? DateTime.local().zoneName
 // initialDate/initialTime's doc comment). All-day events have no timezone
 // of their own; their ISO instants are UTC-midnight-anchored calendar
 // dates, so those are read back in UTC rather than the event's/browser's zone.
-const initialZone = initialAllDay ? 'utc' : (props.event?.timezone ?? browserZone)
+const initialZone = initialAllDay ? 'utc' : (source?.timezone ?? browserZone)
 
 // All-day events are stored/transmitted with an *exclusive* end (CalDAV's
 // DTEND convention: a single-day event has end = start + 1 day) but the
@@ -234,15 +243,15 @@ const defaultWeekday = ISO_WEEKDAY_TO_CODE[startDt.weekday - 1]
 // Aug 11 2026 is the 2nd Tuesday, so that's the default if the user
 // switches to "on the Nth weekday" mode without picking an ordinal.
 const defaultMonthlyOrdinal = Math.ceil(startDt.day / 7)
-const parsedRepeat = parseRepeat(props.event?.rrule ?? null, defaultUntil, defaultWeekday, defaultMonthlyOrdinal, initialZone)
+const parsedRepeat = parseRepeat(source?.rrule ?? null, defaultUntil, defaultWeekday, defaultMonthlyOrdinal, initialZone)
 
 const form = reactive({
-  calendarId: props.event?.calendarId ?? props.defaultCalendarId,
-  summary: props.event?.summary ?? '',
-  description: props.event?.description ?? '',
-  location: props.event?.location ?? '',
+  calendarId: props.event?.calendarId ?? props.template?.calendarId ?? props.defaultCalendarId,
+  summary: props.event ? props.event.summary : props.template ? `Copy of ${props.template.summary}` : '',
+  description: source?.description ?? '',
+  location: source?.location ?? '',
   allDay: initialAllDay,
-  timezone: props.event?.timezone ?? browserZone,
+  timezone: source?.timezone ?? browserZone,
   startDate: initialDate(initialStartIso, initialZone),
   startTime: initialTime(initialStartIso, initialZone),
   endDate: initialEndDateDisplay,
@@ -256,12 +265,12 @@ const form = reactive({
   monthlyMode: parsedRepeat.monthlyMode,
   monthlyOrdinal: parsedRepeat.monthlyOrdinal,
   monthlyWeekday: parsedRepeat.monthlyWeekday,
-  color: props.event?.color ?? '',
-  reminders: props.event?.alarms?.map((a) => a.minutesBefore) ?? [],
+  color: source?.color ?? '',
+  reminders: source?.alarms?.map((a) => a.minutesBefore) ?? [],
   // Extra one-off occurrence dates on top of the RRULE -- date-only
   // ('yyyy-LL-dd'), always interpreted in form.timezone like the rest of
   // the form's date/time fields.
-  rdates: (props.event?.rdate ?? []).map((iso) => DateTime.fromISO(iso, { zone: initialZone }).toFormat('yyyy-LL-dd')),
+  rdates: (source?.rdate ?? []).map((iso) => DateTime.fromISO(iso, { zone: initialZone }).toFormat('yyyy-LL-dd')),
 })
 
 function addRdate(): void {
@@ -303,28 +312,43 @@ const isEditing = computed(() => props.event !== null)
 // to be there -- for an event that was created as all-day, that's 00:00 for
 // both, an instantly-invalid zero-length range once time fields reappear.
 // Reset to a sensible default hour block instead.
+let suppressDurationSync = false
 watch(
   () => form.allDay,
   (allDay, wasAllDay) => {
     if (wasAllDay && !allDay) {
+      // Don't let the duration-sync watch below react to these writes.
+      suppressDurationSync = true
       form.startTime = '00:00'
       form.endTime = '01:00'
+      void nextTick(() => {
+        suppressDurationSync = false
+      })
     }
   },
 )
 
-// Moving the start date should carry the end date along with it so a
-// multi-day span keeps its length instead of silently becoming invalid
-// (or requiring a second manual edit) whenever the start is nudged.
+// Keep the event's length constant when the start changes: shift the end by
+// the same amount, like every other calendar app. Skipped while a field is
+// mid-edit / unparseable.
 watch(
-  () => form.startDate,
-  (newStart, oldStart) => {
-    if (!oldStart || !newStart) return
-    const dayDelta = DateTime.fromFormat(form.endDate, 'yyyy-LL-dd').diff(
-      DateTime.fromFormat(oldStart, 'yyyy-LL-dd'),
-      'days',
-    ).days
-    form.endDate = DateTime.fromFormat(newStart, 'yyyy-LL-dd').plus({ days: dayDelta }).toFormat('yyyy-LL-dd')
+  () => [form.startDate, form.startTime] as const,
+  ([newDate, newTime], [oldDate, oldTime]) => {
+    if (suppressDurationSync || (newDate === oldDate && newTime === oldTime)) return
+
+    const parse = (d: string, t: string): DateTime =>
+      form.allDay
+        ? DateTime.fromFormat(d, 'yyyy-LL-dd')
+        : DateTime.fromFormat(`${d} ${t}`, 'yyyy-LL-dd HH:mm', { zone: form.timezone })
+
+    const oldStart = parse(oldDate, oldTime)
+    const newStart = parse(newDate, newTime)
+    const oldEnd = parse(form.endDate, form.endTime)
+    if (!oldStart.isValid || !newStart.isValid || !oldEnd.isValid) return
+
+    const newEnd = oldEnd.plus(newStart.diff(oldStart))
+    form.endDate = newEnd.toFormat('yyyy-LL-dd')
+    if (!form.allDay) form.endTime = newEnd.toFormat('HH:mm')
   },
 )
 
@@ -340,7 +364,7 @@ const intervalUnitLabel = computed(() => {
 
 function buildRrule(): string | null {
   if (form.repeat === 'none') return null
-  if (form.repeat === 'custom') return props.event?.rrule ?? null
+  if (form.repeat === 'custom') return source?.rrule ?? null
 
   const parts = [`FREQ=${FREQ_BY_REPEAT[form.repeat]}`]
   if (form.repeatInterval > 1) parts.push(`INTERVAL=${form.repeatInterval}`)
@@ -664,6 +688,7 @@ const writableCalendars = computed(() =>
       <p v-if="validationError" class="dialog__error">{{ validationError }}</p>
 
       <div class="dialog__actions">
+        <button v-if="isEditing" type="button" class="btn btn-ghost" @click="emit('duplicate')">Duplicate</button>
         <button v-if="isEditing" type="button" class="btn btn-danger dialog__delete" @click="emit('remove')">
           Delete
         </button>

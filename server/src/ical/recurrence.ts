@@ -1,12 +1,23 @@
 import type { CalendarObject, TimeRange } from '@yourcal/shared'
 import ICAL from 'ical.js'
-import { buildCalendarObject } from './mapper.js'
+import { buildCalendarObject, icalTimeToString } from './mapper.js'
 import { registerEmbeddedTimezones } from './timezones.js'
 
-// Safety cap so an open-ended RRULE (no UNTIL/COUNT) can't spin the
-// expansion loop forever -- bound to the requested range plus one guard
-// on iteration count.
+// Safety cap on the number of *in-range* occurrences we'll materialize for
+// a single series -- an open-ended RRULE (no UNTIL/COUNT) still can't spin
+// forever because the loop also breaks once occurrences pass rangeEnd.
 const MAX_ITERATIONS = 5000
+
+// Separate, much larger budget for fast-forwarding the iterator from
+// DTSTART up to rangeStart. The iterator always starts at DTSTART, so a
+// long-running dense series (e.g. a daily event older than ~13.7 years)
+// can have far more than MAX_ITERATIONS occurrences *before* the visible
+// window -- counting those against MAX_ITERATIONS made the whole series
+// silently vanish from the view. These skipped iterations are cheap
+// (no getOccurrenceDetails / buildCalendarObject), so the cap only needs
+// to be high enough to never bite in practice while still bounding a
+// pathological RRULE with a tiny interval and a very old DTSTART.
+const MAX_SKIP_ITERATIONS = 500_000
 
 /**
  * Expands a (possibly recurring) ICS object into the occurrences that
@@ -68,10 +79,15 @@ export function expandCalendarObject(
   const iterator = masterEvent.iterator()
   let occurrenceTime: ICAL.Time | null
   let guard = 0
+  let skipGuard = 0
 
-  while ((occurrenceTime = iterator.next()) && guard++ < MAX_ITERATIONS) {
+  while ((occurrenceTime = iterator.next())) {
     if (occurrenceTime.compare(rangeEnd) > 0) break
-    if (occurrenceTime.compare(rangeStart) < 0) continue
+    if (occurrenceTime.compare(rangeStart) < 0) {
+      if (++skipGuard >= MAX_SKIP_ITERATIONS) break
+      continue
+    }
+    if (guard++ >= MAX_ITERATIONS) break
 
     const details = masterEvent.getOccurrenceDetails(occurrenceTime)
     // details.item may be the master (plain occurrence) or an exception
@@ -87,7 +103,13 @@ export function expandCalendarObject(
         href,
         start: details.startDate,
         end: details.endDate,
-        recurrenceId: details.recurrenceId.toJSDate().toISOString(),
+        // For an all-day series details.recurrenceId is DATE-typed;
+        // toJSDate().toISOString() would apply the server process's UTC
+        // offset and, under a non-UTC TZ, shift it to the adjacent day
+        // (editScope then slices the first 10 chars and EXDATEs/overrides
+        // the wrong date). icalTimeToString emits a bare YYYY-MM-DD for
+        // DATE values and an ISO instant only for timed ones.
+        recurrenceId: icalTimeToString(details.recurrenceId),
         isRecurring: true,
         rrule: masterRrule,
       }),
