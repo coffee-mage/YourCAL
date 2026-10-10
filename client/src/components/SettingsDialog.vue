@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { REMINDER_PRESETS } from '../lib/reminders.js'
 import { useCalendarsStore } from '../stores/calendars.js'
 import {
+  DEFAULT_EVENT_LENGTHS,
   useSettingsStore,
   type CalendarSortOrder,
   type CalendarViewType,
   type DefaultCalendarMode,
+  type Theme,
+  type TimeFormat,
   type WeekStart,
 } from '../stores/settings.js'
 
@@ -24,10 +28,62 @@ const calendarSortOrderModel = computed<CalendarSortOrder>({
   set: (value) => settingsStore.setCalendarSortOrder(value),
 })
 
+const timeFormatModel = computed<TimeFormat>({
+  get: () => settingsStore.timeFormat,
+  set: (value) => settingsStore.setTimeFormat(value),
+})
+
 const defaultViewModel = computed<CalendarViewType>({
   get: () => settingsStore.defaultView,
   set: (value) => settingsStore.setDefaultView(value),
 })
+
+const themeModel = computed<Theme>({
+  get: () => settingsStore.theme,
+  set: (value) => settingsStore.setTheme(value),
+})
+
+const nowIndicatorModel = computed<boolean>({
+  get: () => settingsStore.nowIndicator,
+  set: (value) => settingsStore.setNowIndicator(value),
+})
+
+const weekNumbersModel = computed<boolean>({
+  get: () => settingsStore.weekNumbers,
+  set: (value) => settingsStore.setWeekNumbers(value),
+})
+
+const showWeekendsModel = computed<boolean>({
+  get: () => settingsStore.showWeekends,
+  set: (value) => settingsStore.setShowWeekends(value),
+})
+
+const scrollHourModel = computed<number>({
+  get: () => settingsStore.scrollHour,
+  set: (value) => settingsStore.setScrollHour(value),
+})
+
+const defaultEventLengthModel = computed<number>({
+  get: () => settingsStore.defaultEventLength,
+  set: (value) => settingsStore.setDefaultEventLength(value),
+})
+
+const defaultReminderModel = computed<number | null>({
+  get: () => settingsStore.defaultReminder,
+  set: (value) => settingsStore.setDefaultReminder(value),
+})
+
+// Labels follow the time-format setting, e.g. "8 AM" vs "08:00".
+function hourLabel(hour: number): string {
+  if (settingsStore.timeFormat === '24h') return `${String(hour).padStart(2, '0')}:00`
+  const h12 = hour % 12 === 0 ? 12 : hour % 12
+  return `${h12} ${hour < 12 ? 'AM' : 'PM'}`
+}
+
+function lengthLabel(minutes: number): string {
+  if (minutes < 60) return `${minutes} minutes`
+  return minutes === 60 ? '1 hour' : `${minutes / 60} hours`
+}
 
 // Same "writable + currently enabled" restriction CalendarView applies when
 // seeding the new-event dialog's default calendar -- a default that's
@@ -47,6 +103,11 @@ const defaultCalendarModel = computed<string>({
   set: (value) => settingsStore.setDefaultCalendarId(value),
 })
 
+const defaultCalendarModeModel = computed<DefaultCalendarMode>({
+  get: () => settingsStore.defaultCalendarMode,
+  set: (value) => settingsStore.setDefaultCalendarMode(value),
+})
+
 // An empty preference list means "no explicit choice yet" -- every calendar
 // is visible, same as before this setting existed -- so an unset checkbox
 // still reads as checked.
@@ -61,17 +122,21 @@ function toggleDefaultVisible(id: string): void {
   const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id]
   settingsStore.setDefaultVisibleCalendarIds(next)
 }
-
-const defaultCalendarModeModel = computed<DefaultCalendarMode>({
-  get: () => settingsStore.defaultCalendarMode,
-  set: (value) => settingsStore.setDefaultCalendarMode(value),
-})
 </script>
 
 <template>
   <div class="overlay" @click.self="emit('close')">
     <div class="dialog">
       <h2>Settings</h2>
+
+      <label class="dialog__field dialog__field--row">
+        <span>Theme</span>
+        <select v-model="themeModel">
+          <option value="auto">Match system</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
 
       <label class="dialog__field dialog__field--row">
         <span>Week starts on</span>
@@ -84,6 +149,7 @@ const defaultCalendarModeModel = computed<DefaultCalendarMode>({
       <label class="dialog__field dialog__field--row">
         <span>Default view</span>
         <select v-model="defaultViewModel">
+          <option value="multiMonthYear">Year</option>
           <option value="dayGridMonth">Month</option>
           <option value="timeGridWeek">Week</option>
           <option value="timeGridDay">Day</option>
@@ -92,11 +158,41 @@ const defaultCalendarModeModel = computed<DefaultCalendarMode>({
       </label>
 
       <label class="dialog__field dialog__field--row">
+        <span>Day/week view opens at</span>
+        <select v-model.number="scrollHourModel">
+          <option v-for="hour in 24" :key="hour - 1" :value="hour - 1">{{ hourLabel(hour - 1) }}</option>
+        </select>
+      </label>
+
+      <label class="dialog__checkbox dialog__field">
+        <input v-model="showWeekendsModel" type="checkbox" />
+        Show weekends
+      </label>
+
+      <label class="dialog__checkbox dialog__field">
+        <input v-model="weekNumbersModel" type="checkbox" />
+        Show week numbers
+      </label>
+
+      <label class="dialog__checkbox dialog__field">
+        <input v-model="nowIndicatorModel" type="checkbox" />
+        Show current-time line
+      </label>
+
+      <label class="dialog__field dialog__field--row">
         <span>Sort calendars by</span>
         <select v-model="calendarSortOrderModel">
           <option value="server">Server order</option>
           <option value="name-asc">Name (A→Z)</option>
           <option value="name-desc">Name (Z→A)</option>
+        </select>
+      </label>
+
+      <label class="dialog__field dialog__field--row">
+        <span>Time format</span>
+        <select v-model="timeFormatModel">
+          <option value="12h">12-hour</option>
+          <option value="24h">24-hour</option>
         </select>
       </label>
 
@@ -114,6 +210,25 @@ const defaultCalendarModeModel = computed<DefaultCalendarMode>({
         <select v-model="defaultCalendarModeModel">
           <option value="fixed">Default calendar</option>
           <option value="last-used">Last used calendar</option>
+        </select>
+      </label>
+
+      <label class="dialog__field dialog__field--row">
+        <span>Default event length</span>
+        <select v-model.number="defaultEventLengthModel">
+          <option v-for="minutes in DEFAULT_EVENT_LENGTHS" :key="minutes" :value="minutes">
+            {{ lengthLabel(minutes) }}
+          </option>
+        </select>
+      </label>
+
+      <label class="dialog__field dialog__field--row">
+        <span>Default reminder</span>
+        <select v-model="defaultReminderModel">
+          <option :value="null">None</option>
+          <option v-for="preset in REMINDER_PRESETS" :key="preset.minutes" :value="preset.minutes">
+            {{ preset.label }}
+          </option>
         </select>
       </label>
 
@@ -153,7 +268,9 @@ const defaultCalendarModeModel = computed<DefaultCalendarMode>({
   padding: 1.5rem;
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  width: 300px;
+  width: 320px;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
   animation: pop-in 0.14s ease;
 }
 .dialog h2 {
@@ -181,6 +298,11 @@ const defaultCalendarModeModel = computed<DefaultCalendarMode>({
   gap: 0.4rem;
   font-size: 0.85rem;
   color: inherit;
+}
+/* Standalone toggle rows match the other setting labels. */
+.dialog__field.dialog__checkbox {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
 }
 .dialog__field select {
   padding: 0.3rem 0.4rem;
